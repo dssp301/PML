@@ -1,0 +1,264 @@
+---
+title: "Exercise Analysis - Barbell Lifts"
+author: "SP"
+date: "November 6, 2014"
+output: 
+    html_document:
+        toc: TRUE
+---
+
+## Executive Summary
+In this report we will analyse and quantify how well exercise enthusiasts lift barbells. The group used devices such as Jawbone Up, Nike FuelBand, and Fitbit to collect a large amount of data about their individual barbell lifts. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. 
+
+We will use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website here: http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset). The barbell lifts were classified as follows: exactly according to the specification (Class A), throwing the elbows to the front (Class B), lifting the dumbbell only halfway (Class C), lowering the dumbbell only halfway (Class D) and throwing the hips to the front (Class E). For more information read: http://groupware.les.inf.puc-rio.br/har#ixzz3J4QJLgcY
+
+Our final objective with this analysis is to exercise the model or models we develop against a set of 20 test cases and to predict the correct class (A, B, C, D, or E) for each case.
+
+-----------
+
+## Load Data
+We will first load the data and libraries needed for this analysis. We will make use of the multicore libraries to make best use of our hardware.  
+```{r Load Data and Libraries, message=FALSE, warning=FALSE, results='hide'}
+
+# Set up parallel processing with 75% of available processors
+if(Sys.info()[1] == "Windows") {
+    library(doParallel)
+    nCores <- round(detectCores()*0.75,0)
+    registerDoParallel(cores = nCores) 
+} else if(Sys.info()[1] == "Darwin") {    
+    library(doMC)
+    nCores <- round(detectCores()*0.75,0)
+    registerDoMC(nCores) 
+}
+
+library(caret)
+library(rpart)
+
+dataDir <- "./Data"
+submitDir <- "./Submit"
+trainFile <- paste0(dataDir, "/pml-training.csv")
+testFile <- paste0(dataDir, "/pml-testing.csv")
+trainFileURL = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+testFileURL = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+if(!file.exists(dataDir)) dir.create(dataDir)
+if(!file.exists(submitDir)) dir.create(submitDir)
+if(!file.exists(trainFile)) download.file(trainFileURL, destfile = trainFile, method = "curl")
+if(!file.exists(testFile)) download.file(testFileURL, destfile = trainFile, method = "curl")
+
+# Read the csv files and make the NA values consistent.
+set.seed(1912)
+training <- read.csv(file = trainFile, stringsAsFactors=TRUE, na.strings = c("", "NA", "#DIV/0!"))
+testing <- read.csv(file = testFile, stringsAsFactors=TRUE, na.strings = c("", "NA", "#DIV/0!"))
+
+
+```  
+
+------------
+
+## Select Features
+Next we will figure out which features will most likely give us the best results for our models.  We will select features that exhibit the variances that are not zero or (near zero).  Loking at the training data we see that there are a significant number of columns that mostly contain NA values. These will be eliminated from both the training data. We will also eliminate the first 7 columns as ther are irrelevant to our present analysis. We eill also eliminate columns that are sparse and columns that are highly correlated. eliminating highly correlated columns gives better results for algorithms like Random Forest. All transformations applied to the training data will also be applied to the testing data. 
+```{r Select Features}
+#View(training)
+cat("Remove first 7 colums:", colnames(training[,1:7]))
+training <- training[, -c(1:7)]
+testing<- testing[, -c(1:7)]
+
+# Remove the NA columns
+naCols <- which(sapply(training, function(x) ifelse(length(which(is.na(x))) / length(x) > .5, TRUE, FALSE)))
+if(length(naCols) > 0) {
+        cat("Remove columns with a large percentage of NA's: ", colnames(training[, naCols]))
+        training <- training[, -naCols]
+        testing <- testing[, -naCols]
+} else {
+        cat("There were no columns with NA's found.")
+}
+
+# compute near zero variance colums to be removed
+# we will use a uniqueCut of 5%. 
+toEliminate <- nearZeroVar(training, freqCut = 95/64, uniqueCut = 5, saveMetrics = FALSE)
+if(length(toEliminate) > 0) {
+        cat("Remove the following zero or nearZero variance columns:", colnames(training[, toEliminate]))
+        training <- training[, -toEliminate]
+        testing <- testing[, -toEliminate]
+} else {
+        cat("There were no columns with zero or near zero variance found.")
+}
+
+# Find any remaining sparse columns and eliminate them
+sparseColumns <- checkConditionalX(training[, -c(ncol(training))], training$classe)
+if(length(sparseColumns) > 0) {
+        cat("Remove the following sparse columns:", colnames(training[, sparseColumns]))
+        training <- training[, -sparseColumns]
+        testing <- testing[, -sparseColumns]
+} else {
+        cat("There were sparse columns found.")
+}
+
+# Determine which of the remaining features are highly correlated
+descrCorr <- cor(sapply(training, as.numeric))
+highCorr <- findCorrelation(descrCorr, 0.90)  # threshold of 0.90
+if(length(highCorr) > 0) {
+        cat("Remove the following highly correlated columns:", colnames(training[, highCorr]))
+        training <- training[, -highCorr]
+        testing <- testing[, -highCorr]
+} else {
+        cat("There were highly correlated columns found.")
+}
+
+# convert all data columns in training and testing data for consistency
+training[,c(1:(ncol(training)-1))] <- as.data.frame(apply(training[,c(1:(ncol(training)-1))], 2, FUN = as.numeric))
+testing[,c(1:(ncol(testing)-1))] <- as.data.frame(apply(testing[,c(1:(ncol(testing)-1))], 2, FUN = as.numeric))
+
+```  
+After all of this transformation we are left with **`r ncol(training)`** meaningful features that will be used for our modeling.
+
+------------
+
+## Explore Models
+Next we will determine which models may be appropriate for our analysis. We will try three models including Conditional Inference Random Forest (cforest), Random Forest (rf) and Gradient Boosetd Model (gbm).  First we will partition the data into a training set that will be used for training the models and into a testing set that wil be used for cross validation and out of sample error assessment.  
+```{r Explore Features and Models}
+table(training$classe)
+
+round(prop.table(table(training$classe))*100, 2)
+
+# Partition the data
+set.seed(2014)
+classeCol <- ncol(training)
+workingSet <- training[createDataPartition(training[, classeCol], p = 2/5, list = FALSE), ]
+inTrain <- createDataPartition(workingSet[, classeCol], p = 3/4, list = FALSE)
+trainDescr <- workingSet[inTrain, -classeCol]
+testDescr <- workingSet[-inTrain, -classeCol]
+trainClass <- workingSet[inTrain, classeCol]
+testClass <- workingSet[-inTrain, classeCol]
+
+prop.table(table(training$classe))
+prop.table(table(trainClass))
+
+
+```  
+
+Next we will run the 3 models using selected training and tuning parameters.
+```{r}
+#Build training parameters
+False = FALSE
+folds=4
+repeats=5
+bootControl <- trainControl(method='repeatedcv', number=folds, repeats=repeats, 
+                          returnResamp='all', classProbs=TRUE,
+                          returnData=FALSE, savePredictions=TRUE, 
+                          verboseIter=TRUE, allowParallel=TRUE,
+                          #summaryFunction=twoClassSummary,
+                          index=createMultiFolds(trainClass[inTrain], k=folds, times=repeats))
+PP <- c('center', 'scale', 'YeoJohnson')
+
+# Run the Cforest model
+set.seed(2)
+crfFit <- train(trainDescr, trainClass, method = 'cforest', trControl = bootControl, metric = 'Accuracy')
+crfFit
+#crfFit$finalModel
+crfElapsedTime <- crfFit$times$everything[3]/60/60
+
+# Run the rf model
+set.seed(2)
+rfFit <- train(trainDescr, trainClass, method = 'rf', tunelength = 5, trControl = bootControl, metric = 'Accuracy')
+rfFit
+#rfFit$finalModel
+rfElapsedTime <- rfFit$times$everything[3]/60/60
+
+# Run the gbm model
+gbmGrid <- expand.grid(interaction.depth = seq(10, 16, by = 3), n.trees = (20:30) * 50, shrinkage = 0.1)
+set.seed(2)
+gbmFit <- train(trainDescr, trainClass, method = 'gbm', trControl = bootControl, verbose = FALSE, tuneGrid = gbmGrid)
+gbmFit
+#gbmFit$finalModel
+gbmElapsedTime <- gbmFit$times$everything[3]/60/60
+
+```   
+
+## Model and Out-of-sample error analysis
+Having created the 3 potential models we will now analyse the performance of each.  We begin with plotting each of the trained models. From the plots below we can intuit that the Random Forest and Gradient Boosted models may be winners and while Conditional Inference model from shows lower accuracy it does show promise.  
+```{r}
+p1 <- plot(crfFit, main = "Conditional Inference Random Forest")
+p2 <- plot(rfFit, main = "Random Forest")
+p3 <- plot(gbmFit, main = "Gradient Boosted Model")
+par(mfrow=c(2,2))
+p1; p2; p3
+```  
+
+Next we will test the 3 models against the training data separated out earlier for cross validation. We will also compute the in-sample and out-of-sample error rates for comparison.  
+```{r}
+crfTrainedAccuracy <- crfFit$results[crfFit$results[,1] == crfFit$bestTune[1,1], 2]
+rfTrainedAccuracy <- rfFit$results[rfFit$results[,1] == rfFit$bestTune[1,1], 2]
+gbmTrainedAccuracy <- gbmFit$results[gbmFit$results[,2] == gbmFit$bestTune[1,2] & gbmFit$results[,3] == gbmFit$bestTune[1,1], 4]
+
+crfInSampleError <- 1 - crfTrainedAccuracy
+rfInSampleError <- 1 - rfTrainedAccuracy
+gbmInSampleError <- 1 - gbmTrainedAccuracy
+
+crfCVResult <- predict(crfFit, newdata = testDescr)
+rfCVResult <- predict(rfFit, newdata = testDescr)
+gbmCVResult <- predict(gbmFit, newdata = testDescr)
+
+crfCVAccuracy <- sum(crfCVResult == testClass) / length(testClass)
+rfCVAccuracy <- sum(rfCVResult == testClass) / length(testClass)
+gbmCVAccuracy <- sum(gbmCVResult == testClass) / length(testClass)
+
+crfOutOfSampleError <- 1 - crfCVAccuracy
+rfOutOfSampleError <- 1 - rfCVAccuracy
+gbmOutOfSampleError <- 1 - gbmCVAccuracy
+
+
+```  
+The in-sample rates were as follows:  
+- Conditional Inference Random Forest: `r round(crfInSampleError * 100, 2)`%  
+- Random Forest: `r round(rfInSampleError * 100, 2)`%  
+- Gradient Boosting Model: `r round(gbmInSampleError * 100, 2)`%  
+  
+The out-sample rates were as follows:  
+- Conditional Inference Random Forest: `r round(crfOutOfSampleError * 100, 2)`%  
+- Random Forest: `r round(rfOutOfSampleError * 100, 2)`%  
+- Gradient Boosting Model: `r round(gbmOutOfSampleError * 100, 2)`%  
+  
+Comparing the in-sample and out-of-sample errors we see that the Random Forest model seems to be the best performer.    
+
+
+## Make Predictions
+Given our exploration so far and using the error rates above as guide we will now predict the appropriate classes for the 20 sample test dataset. We will conduct the prediction against all 3 models and compare the differences.
+```{r Make Predictions}
+
+crfPred <- predict(crfFit, newdata = testing[,-46])
+rfPred <- predict(rfFit, newdata = testing[,-46])
+gbmPred <- predict(gbmFit, newdata = testing[,-46])
+
+cat("Conditional Inference Random Forests: ", as.character(crfPred))
+cat("                     Random Forests : ", as.character(rfPred))
+cat("             Gradient Boosting Model: ", as.character(gbmPred))
+
+```  
+The Random Forest and and Gradient Boosting models give us identicle results.  And the Conditional Inference model is very close.  We will build our submission set using the Random Forest model.
+
+## Build submission set
+```{r Submit}
+
+submission <- function(prefix, pred) {
+        n <- length(pred)
+        for (i in 1:n) {
+                file <- paste0(prefix, i, ".txt")
+                write.table(pred[i], file=file, quote=FALSE, row.names=FALSE,col.names=FALSE)
+        }
+}
+submission(paste0(submitDir, "/Submitcase_"),rfPred)
+
+```  
+
+
+## Appendix
+```{r}
+Sys.info()
+
+cat("Model Execution Times:")
+cat("\tcrf: ", crfElapsedTime, " hours")
+cat("\t rf: ", rfElapsedTime, " hours")
+cat("\tgbm: ", gbmElapsedTime, " hours")
+
+```  
